@@ -7,7 +7,7 @@ This SDK intentionally avoids any UI/TUI integration. It focuses on process cont
 ## Install
 
 ```bash
-go get github.com/garymjr/pi-sdk
+go get github.com/garymjr/pi-sdk-go
 ```
 
 ## Quick Start
@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"log"
 
-	pisdk "github.com/garymjr/pi-sdk"
+	pisdk "github.com/garymjr/pi-sdk-go"
 )
 
 func main() {
