@@ -164,6 +164,14 @@ type CommandDescriptor struct {
 	Path        string `json:"path,omitempty"`
 }
 
+// AssistantOutcome captures the latest assistant message summary.
+type AssistantOutcome struct {
+	Text         string
+	ErrorMessage string
+	StopReason   string
+	Message      AgentMessage
+}
+
 // Event is a raw RPC event envelope (non-response JSON line).
 type Event struct {
 	Type string

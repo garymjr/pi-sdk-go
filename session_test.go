@@ -96,6 +96,61 @@ func TestGetAvailableModels(t *testing.T) {
 	}
 }
 
+func TestGetLastAssistantOutcome(t *testing.T) {
+	s := newTestSession(t)
+
+	outcome, err := s.GetLastAssistantOutcome(context.Background())
+	if err != nil {
+		t.Fatalf("GetLastAssistantOutcome failed: %v", err)
+	}
+	if outcome == nil {
+		t.Fatal("expected assistant outcome")
+	}
+	if outcome.ErrorMessage != "model quota exceeded" {
+		t.Fatalf("unexpected error message: %q", outcome.ErrorMessage)
+	}
+	if outcome.Text != "" {
+		t.Fatalf("expected empty text, got: %q", outcome.Text)
+	}
+	if outcome.StopReason != "error" {
+		t.Fatalf("unexpected stop reason: %q", outcome.StopReason)
+	}
+
+	outcomeSince, index, err := s.GetLatestAssistantOutcomeSince(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("GetLatestAssistantOutcomeSince failed: %v", err)
+	}
+	if outcomeSince == nil {
+		t.Fatal("expected assistant outcome since index")
+	}
+	if index != 1 {
+		t.Fatalf("unexpected index: %d", index)
+	}
+	if outcomeSince.ErrorMessage != "model quota exceeded" {
+		t.Fatalf("unexpected error message since index: %q", outcomeSince.ErrorMessage)
+	}
+}
+
+func TestPromptLateFailureResponse(t *testing.T) {
+	s := newTestSession(t)
+
+	err := s.Prompt(context.Background(), "fail-after-ack", nil)
+	if err == nil {
+		t.Fatal("expected prompt to fail")
+	}
+
+	cmdErr, ok := err.(*CommandError)
+	if !ok {
+		t.Fatalf("expected CommandError, got %T", err)
+	}
+	if cmdErr.Command != "prompt" {
+		t.Fatalf("unexpected command in error: %s", cmdErr.Command)
+	}
+	if cmdErr.Message != "No API key found for opencode." {
+		t.Fatalf("unexpected prompt late failure message: %q", cmdErr.Message)
+	}
+}
+
 func newTestSession(t *testing.T) *AgentSession {
 	t.Helper()
 
@@ -152,6 +207,19 @@ func runFakeRPC() {
 
 		switch commandType {
 		case "prompt":
+			message, _ := command["message"].(string)
+			if message == "fail-after-ack" {
+				write(map[string]any{"type": "response", "id": id, "command": commandType, "success": true})
+				write(map[string]any{
+					"type":    "response",
+					"id":      id,
+					"command": commandType,
+					"success": false,
+					"error":   "No API key found for opencode.",
+				})
+				continue
+			}
+
 			write(map[string]any{"type": "response", "id": id, "command": commandType, "success": true})
 			write(map[string]any{
 				"type":    "message_update",
@@ -233,6 +301,29 @@ func runFakeRPC() {
 						"contextWindow": 200000,
 						"maxTokens":     16384,
 					}},
+				},
+			})
+		case "get_messages":
+			write(map[string]any{
+				"type":    "response",
+				"id":      id,
+				"command": commandType,
+				"success": true,
+				"data": map[string]any{
+					"messages": []map[string]any{
+						{
+							"role": "user",
+							"content": []map[string]any{
+								{"type": "text", "text": "hello"},
+							},
+						},
+						{
+							"role":         "assistant",
+							"content":      []map[string]any{},
+							"stopReason":   "error",
+							"errorMessage": "model quota exceeded",
+						},
+					},
 				},
 			})
 		default:

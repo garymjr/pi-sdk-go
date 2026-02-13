@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -173,6 +174,9 @@ func (s *AgentSession) readLoop(stdout io.Reader) {
 			if err := json.Unmarshal(line, &response); err != nil {
 				continue
 			}
+			// Some Pi builds emit additional response frames (for example late prompt failures).
+			// Forward all response frames to subscribers so callers can react to secondary errors.
+			s.dispatchEvent(Event{Type: envelope.Type, Raw: line})
 			s.dispatchResponse(response)
 			continue
 		}
@@ -428,8 +432,50 @@ func (s *AgentSession) Prompt(ctx context.Context, message string, opts *PromptO
 			command["streamingBehavior"] = opts.StreamingBehavior
 		}
 	}
-	_, err := s.callRPC(ctx, command)
-	return err
+
+	lateErrorCh := make(chan rpcResponse, 1)
+	unsubscribe := s.Subscribe(func(event Event) {
+		if event.Type != "response" {
+			return
+		}
+
+		var response rpcResponse
+		if err := event.Decode(&response); err != nil {
+			return
+		}
+		if response.Command != "prompt" || response.Success {
+			return
+		}
+
+		select {
+		case lateErrorCh <- response:
+		default:
+		}
+	})
+	defer unsubscribe()
+
+	initialResponse, err := s.callRPC(ctx, command)
+	if err != nil {
+		return err
+	}
+
+	// Guard window for late prompt failures after an initial ack.
+	timer := time.NewTimer(300 * time.Millisecond)
+	defer timer.Stop()
+
+	for {
+		select {
+		case response := <-lateErrorCh:
+			if response.ID != initialResponse.ID {
+				continue
+			}
+			return &CommandError{Command: response.Command, Message: response.Error}
+		case <-timer.C:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 // Steer queues a steering message to interrupt the current run.
@@ -688,6 +734,79 @@ func (s *AgentSession) GetLastAssistantText(ctx context.Context) (*string, error
 		return nil, err
 	}
 	return data.Text, nil
+}
+
+// GetLastAssistantOutcome returns the latest assistant message summary, including text and error fields.
+func (s *AgentSession) GetLastAssistantOutcome(ctx context.Context) (*AssistantOutcome, error) {
+	outcome, _, err := s.GetLatestAssistantOutcomeSince(ctx, 0)
+	if err != nil {
+		return nil, err
+	}
+	return outcome, nil
+}
+
+// GetLatestAssistantOutcomeSince returns the latest assistant outcome at or after startIndex.
+func (s *AgentSession) GetLatestAssistantOutcomeSince(ctx context.Context, startIndex int) (*AssistantOutcome, int, error) {
+	messages, err := s.GetMessages(ctx)
+	if err != nil {
+		return nil, -1, err
+	}
+	if startIndex < 0 {
+		startIndex = 0
+	}
+	if startIndex > len(messages) {
+		startIndex = len(messages)
+	}
+
+	for i := len(messages) - 1; i >= 0; i-- {
+		if i < startIndex {
+			break
+		}
+
+		message := messages[i]
+
+		role, _ := message["role"].(string)
+		if role != "assistant" {
+			continue
+		}
+
+		return parseAssistantOutcome(message), i, nil
+	}
+
+	return nil, -1, nil
+}
+
+func parseAssistantOutcome(message AgentMessage) *AssistantOutcome {
+	outcome := &AssistantOutcome{
+		Message: message,
+	}
+
+	if stopReason, ok := message["stopReason"].(string); ok {
+		outcome.StopReason = stopReason
+	}
+	if errorMessage, ok := message["errorMessage"].(string); ok {
+		outcome.ErrorMessage = strings.TrimSpace(errorMessage)
+	}
+
+	content, _ := message["content"].([]any)
+	var textBuilder strings.Builder
+	for _, item := range content {
+		part, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if partType, _ := part["type"].(string); partType != "text" {
+			continue
+		}
+		text, _ := part["text"].(string)
+		if strings.TrimSpace(text) == "" {
+			continue
+		}
+		textBuilder.WriteString(text)
+	}
+
+	outcome.Text = strings.TrimSpace(textBuilder.String())
+	return outcome
 }
 
 // SetSessionName sets the display name for the active session.
