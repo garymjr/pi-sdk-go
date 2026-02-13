@@ -63,6 +63,9 @@ Core:
 - `(*AgentSession).Subscribe(...)`
 - `(*AgentSession).Call(...)` (raw command escape hatch)
 - `(*AgentSession).Close()`
+- `(*AgentSession).WaitForIdle(...)`
+- `RunPrintMode(...)`
+- `RunRPCMode(...)`
 
 Prompting:
 - `Prompt`
@@ -83,6 +86,7 @@ Queue and compaction/retry:
 - `SetSteeringMode`
 - `SetFollowUpMode`
 - `Compact`
+- `AbortCompaction`
 - `SetAutoCompaction`
 - `SetAutoRetry`
 - `AbortRetry`
@@ -99,6 +103,19 @@ Bash and session utilities:
 - `GetSessionStats`
 - `ExportHTML`
 - `GetCommands`
+
+Raw JSON convenience:
+- `GetMessagesJSON`
+- `GetAvailableModelsJSON`
+- `GetCommandsJSON`
+- `GetSessionStatsJSON`
+- `GetForkMessagesJSON`
+
+Zig-parity extras:
+- Tool presets/factories (`ReadTool`, `CreateCodingTools`, etc.)
+- `SessionManager` and `SettingsManager` startup options
+- `DefaultResourceLoader` and `CreateAgentSession(...).ExtensionsResult`
+- `NavigateTree`/`SendHookMessage` return `ErrUnsupportedInRPCMode` (same RPC-mode limitation)
 
 ## Notes
 

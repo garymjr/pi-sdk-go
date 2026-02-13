@@ -20,6 +20,8 @@ var (
 	ErrSessionClosed = errors.New("pi session is closed")
 )
 
+const defaultMaxLineBytes = 4 * 1024 * 1024
+
 // CreateAgentSessionOptions controls process launch and default Pi RPC flags.
 type CreateAgentSessionOptions struct {
 	BinaryPath string
@@ -28,8 +30,14 @@ type CreateAgentSessionOptions struct {
 	// Useful for tests where BinaryPath is a wrapper executable.
 	BinaryArgs []string
 
+	// RawSpawnArgs replaces default RPC argument composition when provided.
+	RawSpawnArgs []string
+
 	// AdditionalArgs are appended after Pi RPC flags.
 	AdditionalArgs []string
+
+	// ExtraArgs are appended after AdditionalArgs.
+	ExtraArgs []string
 
 	Provider   string
 	Model      string
@@ -38,16 +46,33 @@ type CreateAgentSessionOptions struct {
 	// DisableSessionPersistence adds --no-session.
 	DisableSessionPersistence bool
 
+	// SessionManager mirrors Zig behavior when set.
+	SessionManager *SessionManager
+
+	// SettingsManager applies startup settings after process launch.
+	SettingsManager *SettingsManager
+
+	// ResourceLoader can supply preloaded extension metadata.
+	ResourceLoader ResourceLoader
+
+	// AgentDir maps to PI_CODING_AGENT_DIR and PI_AGENT_DIR.
+	AgentDir string
+
 	Cwd string
 	Env []string
 
 	// Stderr receives subprocess stderr. Defaults to io.Discard.
 	Stderr io.Writer
+
+	// MaxLineBytes controls max JSON event line size. Defaults to 4MiB.
+	MaxLineBytes int
 }
 
 // CreateAgentSessionResult mirrors the JS SDK surface where session creation returns a struct.
 type CreateAgentSessionResult struct {
-	Session *AgentSession
+	Session              *AgentSession
+	ExtensionsResult     LoadExtensionsResult
+	ModelFallbackMessage *string
 }
 
 type rpcResponse struct {
@@ -81,6 +106,11 @@ type AgentSession struct {
 
 	terminalErrMu sync.Mutex
 	terminalErr   error
+
+	maxLineBytes int
+
+	lastCommandErrMu      sync.Mutex
+	lastCommandErrMessage string
 }
 
 // CreateAgentSession starts `pi --mode rpc` and returns a connected headless session.
@@ -90,30 +120,23 @@ func CreateAgentSession(ctx context.Context, opts CreateAgentSessionOptions) (*C
 		binary = "pi"
 	}
 
-	args := make([]string, 0, len(opts.BinaryArgs)+10+len(opts.AdditionalArgs))
-	args = append(args, opts.BinaryArgs...)
-	args = append(args, "--mode", "rpc")
-	if opts.Provider != "" {
-		args = append(args, "--provider", opts.Provider)
-	}
-	if opts.Model != "" {
-		args = append(args, "--model", opts.Model)
-	}
-	if opts.DisableSessionPersistence {
-		args = append(args, "--no-session")
-	}
-	if opts.SessionDir != "" {
-		args = append(args, "--session-dir", opts.SessionDir)
-	}
-	args = append(args, opts.AdditionalArgs...)
+	args := buildSessionArgs(opts)
 
 	cmd := exec.CommandContext(ctx, binary, args...)
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
 	}
 
+	env := append([]string(nil), os.Environ()...)
 	if len(opts.Env) > 0 {
-		cmd.Env = append(os.Environ(), opts.Env...)
+		env = append(env, opts.Env...)
+	}
+	if opts.AgentDir != "" {
+		env = setEnvVar(env, "PI_CODING_AGENT_DIR", opts.AgentDir)
+		env = setEnvVar(env, "PI_AGENT_DIR", opts.AgentDir)
+	}
+	if len(env) > 0 {
+		cmd.Env = env
 	}
 
 	stdout, err := cmd.StdoutPipe()
@@ -142,12 +165,141 @@ func CreateAgentSession(ctx context.Context, opts CreateAgentSessionOptions) (*C
 		pending:     map[string]chan rpcResponse{},
 		subscribers: map[uint64]func(Event){},
 		done:        make(chan struct{}),
+		maxLineBytes: func() int {
+			if opts.MaxLineBytes > 0 {
+				return opts.MaxLineBytes
+			}
+			return defaultMaxLineBytes
+		}(),
 	}
 
 	go session.readLoop(stdout)
 	go session.waitLoop()
 
-	return &CreateAgentSessionResult{Session: session}, nil
+	if opts.SettingsManager != nil {
+		if err := applyStartupSettings(ctx, session, opts.SettingsManager.Settings); err != nil {
+			_ = session.Close()
+			return nil, err
+		}
+	}
+
+	extensionsResult, err := resolveExtensionsResult(opts)
+	if err != nil {
+		_ = session.Close()
+		return nil, err
+	}
+
+	return &CreateAgentSessionResult{
+		Session:          session,
+		ExtensionsResult: extensionsResult,
+	}, nil
+}
+
+func buildSessionArgs(opts CreateAgentSessionOptions) []string {
+	if len(opts.RawSpawnArgs) > 0 {
+		return append([]string(nil), opts.RawSpawnArgs...)
+	}
+
+	args := make([]string, 0, len(opts.BinaryArgs)+10+len(opts.AdditionalArgs)+len(opts.ExtraArgs))
+	args = append(args, opts.BinaryArgs...)
+	args = append(args, "--mode", "rpc")
+
+	if opts.Provider != "" {
+		args = append(args, "--provider", opts.Provider)
+	}
+	if opts.Model != "" {
+		args = append(args, "--model", opts.Model)
+	}
+
+	if opts.SessionManager != nil {
+		switch opts.SessionManager.Mode {
+		case "", SessionManagerModeInMemory:
+			args = append(args, "--no-session")
+		case SessionManagerModePersistent:
+			sessionDir := opts.SessionManager.SessionDir
+			if sessionDir == "" {
+				sessionDir = opts.SessionDir
+			}
+			if sessionDir != "" {
+				args = append(args, "--session-dir", sessionDir)
+			}
+		}
+	} else {
+		if opts.SessionDir != "" {
+			args = append(args, "--session-dir", opts.SessionDir)
+		} else if opts.DisableSessionPersistence || opts.SessionManager == nil {
+			// Zig parity default is in-memory sessions when session manager is not set.
+			args = append(args, "--no-session")
+		}
+	}
+
+	args = append(args, opts.AdditionalArgs...)
+	args = append(args, opts.ExtraArgs...)
+	return args
+}
+
+func setEnvVar(env []string, key, value string) []string {
+	prefix := key + "="
+	for i, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			env[i] = prefix + value
+			return env
+		}
+	}
+	return append(env, prefix+value)
+}
+
+func applyStartupSettings(ctx context.Context, session *AgentSession, settings Settings) error {
+	if settings.AutoCompactionEnabled != nil {
+		if err := session.SetAutoCompaction(ctx, *settings.AutoCompactionEnabled); err != nil {
+			return err
+		}
+	}
+	if settings.AutoRetryEnabled != nil {
+		if err := session.SetAutoRetry(ctx, *settings.AutoRetryEnabled); err != nil {
+			return err
+		}
+	}
+	if settings.ThinkingLevel != nil {
+		if err := session.SetThinkingLevel(ctx, *settings.ThinkingLevel); err != nil {
+			return err
+		}
+	}
+	if settings.SteeringMode != nil {
+		if err := session.SetSteeringMode(ctx, *settings.SteeringMode); err != nil {
+			return err
+		}
+	}
+	if settings.FollowUpMode != nil {
+		if err := session.SetFollowUpMode(ctx, *settings.FollowUpMode); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func resolveExtensionsResult(opts CreateAgentSessionOptions) (LoadExtensionsResult, error) {
+	if opts.ResourceLoader != nil {
+		return LoadExtensionsResult{
+			Extensions: append([]ResourceEntry(nil), opts.ResourceLoader.GetExtensions()...),
+		}, nil
+	}
+
+	loader, err := NewDefaultResourceLoader(DefaultResourceLoaderOptions{
+		Cwd:      opts.Cwd,
+		AgentDir: opts.AgentDir,
+	})
+	if err != nil {
+		return LoadExtensionsResult{}, err
+	}
+
+	if err := loader.Reload(); err != nil {
+		return LoadExtensionsResult{}, err
+	}
+
+	return LoadExtensionsResult{
+		Extensions: loader.GetExtensions(),
+	}, nil
 }
 
 func (s *AgentSession) waitLoop() {
@@ -157,7 +309,11 @@ func (s *AgentSession) waitLoop() {
 
 func (s *AgentSession) readLoop(stdout io.Reader) {
 	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 1024), 10*1024*1024)
+	maxLineBytes := s.maxLineBytes
+	if maxLineBytes <= 0 {
+		maxLineBytes = defaultMaxLineBytes
+	}
+	scanner.Buffer(make([]byte, 1024), maxLineBytes)
 
 	for scanner.Scan() {
 		line := append([]byte(nil), scanner.Bytes()...)
@@ -343,6 +499,7 @@ func (s *AgentSession) callRPC(ctx context.Context, command map[string]any) (rpc
 	if !ok || commandType == "" {
 		return rpcResponse{}, errors.New("command must include non-empty type")
 	}
+	s.setLastCommandError("")
 
 	select {
 	case <-s.done:
@@ -369,6 +526,7 @@ func (s *AgentSession) callRPC(ctx context.Context, command map[string]any) (rpc
 			return rpcResponse{}, s.sessionClosedError()
 		}
 		if !response.Success {
+			s.setLastCommandError(response.Error)
 			return rpcResponse{}, &CommandError{Command: response.Command, Message: response.Error}
 		}
 		return response, nil
@@ -379,6 +537,23 @@ func (s *AgentSession) callRPC(ctx context.Context, command map[string]any) (rpc
 		s.removePending(id)
 		return rpcResponse{}, s.sessionClosedError()
 	}
+}
+
+func (s *AgentSession) setLastCommandError(message string) {
+	s.lastCommandErrMu.Lock()
+	defer s.lastCommandErrMu.Unlock()
+	s.lastCommandErrMessage = message
+}
+
+// LastErrorMessage returns the most recent RPC command failure message, if any.
+func (s *AgentSession) LastErrorMessage() *string {
+	s.lastCommandErrMu.Lock()
+	defer s.lastCommandErrMu.Unlock()
+	if s.lastCommandErrMessage == "" {
+		return nil
+	}
+	value := s.lastCommandErrMessage
+	return &value
 }
 
 func (s *AgentSession) decodeData(raw json.RawMessage, out any) error {
@@ -510,6 +685,30 @@ func (s *AgentSession) Abort(ctx context.Context) error {
 	return err
 }
 
+// WaitForIdle waits for the next agent_end event.
+func (s *AgentSession) WaitForIdle(ctx context.Context) error {
+	idleCh := make(chan struct{}, 1)
+	unsubscribe := s.Subscribe(func(event Event) {
+		if event.Type != "agent_end" {
+			return
+		}
+		select {
+		case idleCh <- struct{}{}:
+		default:
+		}
+	})
+	defer unsubscribe()
+
+	select {
+	case <-idleCh:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.done:
+		return s.sessionClosedError()
+	}
+}
+
 // NewSession starts a fresh session, optionally tracking a parent session path.
 func (s *AgentSession) NewSession(ctx context.Context, parentSession string) (SessionActionResult, error) {
 	command := map[string]any{"type": "new_session"}
@@ -560,6 +759,11 @@ func (s *AgentSession) GetMessages(ctx context.Context) ([]AgentMessage, error) 
 	return data.Messages, nil
 }
 
+// GetMessagesJSON returns raw `data` JSON for get_messages.
+func (s *AgentSession) GetMessagesJSON(ctx context.Context) ([]byte, error) {
+	return s.getRawDataJSON(ctx, "get_messages")
+}
+
 // SetModel switches to a specific provider/model pair.
 func (s *AgentSession) SetModel(ctx context.Context, provider, modelID string) (Model, error) {
 	var model Model
@@ -590,6 +794,11 @@ func (s *AgentSession) GetAvailableModels(ctx context.Context) ([]Model, error) 
 		return nil, err
 	}
 	return data.Models, nil
+}
+
+// GetAvailableModelsJSON returns raw `data` JSON for get_available_models.
+func (s *AgentSession) GetAvailableModelsJSON(ctx context.Context) ([]byte, error) {
+	return s.getRawDataJSON(ctx, "get_available_models")
 }
 
 // SetThinkingLevel updates reasoning level.
@@ -641,6 +850,11 @@ func (s *AgentSession) Compact(ctx context.Context, customInstructions string) (
 	return result, nil
 }
 
+// AbortCompaction aborts compaction work (RPC alias to abort).
+func (s *AgentSession) AbortCompaction(ctx context.Context) error {
+	return s.Abort(ctx)
+}
+
 // SetAutoCompaction toggles automatic compaction.
 func (s *AgentSession) SetAutoCompaction(ctx context.Context, enabled bool) error {
 	_, err := s.callRPC(ctx, map[string]any{"type": "set_auto_compaction", "enabled": enabled})
@@ -685,6 +899,11 @@ func (s *AgentSession) GetSessionStats(ctx context.Context) (SessionStats, error
 	return result, nil
 }
 
+// GetSessionStatsJSON returns raw `data` JSON for get_session_stats.
+func (s *AgentSession) GetSessionStatsJSON(ctx context.Context) ([]byte, error) {
+	return s.getRawDataJSON(ctx, "get_session_stats")
+}
+
 // ExportHTML exports current session to HTML and returns the output path.
 func (s *AgentSession) ExportHTML(ctx context.Context, outputPath string) (string, error) {
 	command := map[string]any{"type": "export_html"}
@@ -722,6 +941,11 @@ func (s *AgentSession) GetForkMessages(ctx context.Context) ([]ForkMessage, erro
 		return nil, err
 	}
 	return data.Messages, nil
+}
+
+// GetForkMessagesJSON returns raw `data` JSON for get_fork_messages.
+func (s *AgentSession) GetForkMessagesJSON(ctx context.Context) ([]byte, error) {
+	return s.getRawDataJSON(ctx, "get_fork_messages")
 }
 
 // GetLastAssistantText returns the latest assistant text, or nil if no assistant messages exist.
@@ -825,4 +1049,49 @@ func (s *AgentSession) GetCommands(ctx context.Context) ([]CommandDescriptor, er
 		return nil, err
 	}
 	return data.Commands, nil
+}
+
+// GetCommandsJSON returns raw `data` JSON for get_commands.
+func (s *AgentSession) GetCommandsJSON(ctx context.Context) ([]byte, error) {
+	return s.getRawDataJSON(ctx, "get_commands")
+}
+
+func (s *AgentSession) getRawDataJSON(ctx context.Context, commandType string) ([]byte, error) {
+	resp, err := s.callRPC(ctx, map[string]any{"type": commandType})
+	if err != nil {
+		return nil, err
+	}
+	if len(resp.Data) == 0 {
+		return []byte("null"), nil
+	}
+
+	out := make([]byte, len(resp.Data))
+	copy(out, resp.Data)
+	return out, nil
+}
+
+// NavigateTree is not currently exposed over Pi RPC mode.
+func (s *AgentSession) NavigateTree(
+	ctx context.Context,
+	targetID string,
+	summarize bool,
+	customInstructions *string,
+	replaceInstructions bool,
+	label *string,
+) error {
+	_ = ctx
+	_ = targetID
+	_ = summarize
+	_ = customInstructions
+	_ = replaceInstructions
+	_ = label
+	return ErrUnsupportedInRPCMode
+}
+
+// SendHookMessage is not currently exposed over Pi RPC mode.
+func (s *AgentSession) SendHookMessage(ctx context.Context, messageJSON string, triggerTurn bool) error {
+	_ = ctx
+	_ = messageJSON
+	_ = triggerTurn
+	return ErrUnsupportedInRPCMode
 }

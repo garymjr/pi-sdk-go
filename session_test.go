@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -78,6 +79,10 @@ func TestSetModelCommandError(t *testing.T) {
 	}
 	if cmdErr.Command != "set_model" {
 		t.Fatalf("unexpected command in error: %s", cmdErr.Command)
+	}
+	lastErr := s.LastErrorMessage()
+	if lastErr == nil || *lastErr != "model not found" {
+		t.Fatalf("unexpected last error message: %v", lastErr)
 	}
 }
 
@@ -183,6 +188,8 @@ func TestHelperProcess(t *testing.T) {
 }
 
 func runFakeRPC() {
+	appendArgsLog()
+
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 1024), 1024*1024)
 
@@ -197,13 +204,15 @@ func runFakeRPC() {
 	}
 
 	for scanner.Scan() {
+		raw := append([]byte(nil), scanner.Bytes()...)
 		var command map[string]any
-		if err := json.Unmarshal(scanner.Bytes(), &command); err != nil {
+		if err := json.Unmarshal(raw, &command); err != nil {
 			continue
 		}
 
 		commandType, _ := command["type"].(string)
 		id, _ := command["id"].(string)
+		appendCommandLog(raw)
 
 		switch commandType {
 		case "prompt":
@@ -221,14 +230,17 @@ func runFakeRPC() {
 			}
 
 			write(map[string]any{"type": "response", "id": id, "command": commandType, "success": true})
-			write(map[string]any{
-				"type":    "message_update",
-				"message": map[string]any{"role": "assistant"},
-				"assistantMessageEvent": map[string]any{
-					"type":  "text_delta",
-					"delta": "hello from fake pi",
-				},
-			})
+			if message != "no-agent-end" {
+				write(map[string]any{
+					"type":    "message_update",
+					"message": map[string]any{"role": "assistant"},
+					"assistantMessageEvent": map[string]any{
+						"type":  "text_delta",
+						"delta": "hello from fake pi",
+					},
+				})
+				write(map[string]any{"type": "agent_end"})
+			}
 		case "get_state":
 			write(map[string]any{
 				"type":    "response",
@@ -326,8 +338,53 @@ func runFakeRPC() {
 					},
 				},
 			})
+		case "get_test_env":
+			write(map[string]any{
+				"type":    "response",
+				"id":      id,
+				"command": commandType,
+				"success": true,
+				"data": map[string]any{
+					"piCodingAgentDir": os.Getenv("PI_CODING_AGENT_DIR"),
+					"piAgentDir":       os.Getenv("PI_AGENT_DIR"),
+				},
+			})
 		default:
 			write(map[string]any{"type": "response", "id": id, "command": commandType, "success": true})
 		}
+	}
+}
+
+func appendCommandLog(raw []byte) {
+	path := strings.TrimSpace(os.Getenv("COMMAND_LOG_PATH"))
+	if path == "" {
+		return
+	}
+
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	_, _ = f.Write(raw)
+	_, _ = f.WriteString("\n")
+}
+
+func appendArgsLog() {
+	path := strings.TrimSpace(os.Getenv("ARGS_LOG_PATH"))
+	if path == "" {
+		return
+	}
+
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	for _, arg := range os.Args {
+		_, _ = f.WriteString(arg)
+		_, _ = f.WriteString("\n")
 	}
 }
